@@ -12,6 +12,15 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+model Category {
+  id        Int        @id @default(autoincrement())
+  name      String
+  parent    Category?  @relation("subcategories", fields: [parentId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  parentId  Int?
+  children  Category[] @relation("subcategories")
+  products  Product[]
+}
+
 model Product {
   id           Int           @id @default(autoincrement())
   name         String
@@ -21,6 +30,8 @@ model Product {
   sellPrice    Float         @default(0)
   quantity     Int           @default(0)
   createdAt    DateTime      @default(now())
+  category     Category?     @relation(fields: [categoryId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  categoryId   Int?
   units        ProductUnit[]
   saleItems    SaleItem[]
 }
@@ -36,7 +47,7 @@ model ProductUnit {
   status     String    @default("in_stock")
   costPrice  Float     @default(0)
   receivedAt DateTime  @default(now())
-  saleItem   SaleItem?
+  saleItems  SaleItem[]
 }
 
 // A customer of the shop. Phone is the unique identifier — used to look up returning customers.
@@ -52,12 +63,13 @@ model Customer {
 // One Sale = one checkout transaction. totalPrice is a snapshot, not recomputed later.
 // Customer is optional — anonymous walk-in sales have customerId = null.
 model Sale {
-  id         Int        @id @default(autoincrement())
-  totalPrice Float
-  createdAt  DateTime   @default(now())
-  customer   Customer?  @relation(fields: [customerId], references: [id])
-  customerId Int?
-  items      SaleItem[]
+  id            Int        @id @default(autoincrement())
+  totalPrice    Float
+  paymentMethod String     @default("cash")
+  createdAt     DateTime   @default(now())
+  customer      Customer?  @relation(fields: [customerId], references: [id])
+  customerId    Int?
+  items         SaleItem[]
 }
 
 // One row per line in the cart. unitPrice is copied from Product.sellPrice at sale time.
@@ -69,7 +81,8 @@ model SaleItem {
   productId     Int
   // Only set for serialized phones; null for accessories.
   unit          ProductUnit? @relation(fields: [productUnitId], references: [id], onDelete: NoAction, onUpdate: NoAction)
-  productUnitId Int?         @unique
+  productUnitId Int?
   unitPrice     Float
   quantity      Int          @default(1)
+  refunded      Boolean      @default(false)
 }

@@ -17,7 +17,7 @@ app.get("/api/health", (req, res) => {
 // Filtering units here means the client only sees units it can actually sell.
 app.get("/api/products", async (req, res) => {
   const products = await prisma.product.findMany({
-    include: { units: { where: { status: "in_stock" } } },
+    include: { units: { where: { status: "in_stock" } }, category: true },
   });
   res.json(products);
 });
@@ -28,7 +28,7 @@ app.get("/api/dashboard", async (req, res) => {
   startOfDay.setHours(0, 0, 0, 0);
 
   // Run all DB queries in parallel so the response is fast
-  const [todayStats, allTimeStats, lowStockAccessories, serializedProducts, saleItems] =
+  const [todayStats, allTimeStats, todayPayment, allTimePayment, lowStockAccessories, serializedProducts, saleItems] =
     await Promise.all([
       // Revenue + sale count for today
       prisma.sale.aggregate({
@@ -41,6 +41,17 @@ app.get("/api/dashboard", async (req, res) => {
         _sum:   { totalPrice: true },
         _count: { id: true },
       }),
+      // Cash vs card split today
+      prisma.sale.groupBy({
+        by:    ["paymentMethod"],
+        where: { createdAt: { gte: startOfDay } },
+        _sum:  { totalPrice: true },
+      }),
+      // Cash vs card split all time
+      prisma.sale.groupBy({
+        by:   ["paymentMethod"],
+        _sum: { totalPrice: true },
+      }),
       // Accessories running low (5 or fewer left)
       prisma.product.findMany({
         where:   { isSerialized: false, quantity: { lte: 5 } },
@@ -52,9 +63,13 @@ app.get("/api/dashboard", async (req, res) => {
         where:   { isSerialized: true },
         include: { units: { where: { status: "in_stock" }, select: { id: true } } },
       }),
-      // Every sale item ever — used to compute top products by revenue
+      // Every sale item ever — used to compute top products and profit
       prisma.saleItem.findMany({
-        include: { product: { select: { name: true } } },
+        include: {
+          product: { select: { name: true, costPrice: true } },
+          unit:    { select: { costPrice: true } },
+          sale:    { select: { createdAt: true } },
+        },
       }),
     ]);
 
@@ -63,25 +78,103 @@ app.get("/api/dashboard", async (req, res) => {
     .filter(p => p.units.length === 0)
     .map(p => ({ id: p.id, name: p.name, quantity: 0 }));
 
-  // Group sale items by product to get revenue + units sold per product
+  // Group sale items by product AND compute costs for profit margin
   const byProduct = {};
+  let todayCost = 0, allTimeCost = 0;
+
   for (const item of saleItems) {
     if (!byProduct[item.productId]) {
       byProduct[item.productId] = { name: item.product.name, revenue: 0, unitsSold: 0 };
     }
-    byProduct[item.productId].revenue    += item.unitPrice * item.quantity;
-    byProduct[item.productId].unitsSold  += item.quantity;
+    byProduct[item.productId].revenue   += item.unitPrice * item.quantity;
+    byProduct[item.productId].unitsSold += item.quantity;
+
+    const unitCost = item.unit?.costPrice ?? item.product.costPrice;
+    const cost     = unitCost * item.quantity;
+    allTimeCost += cost;
+    if (new Date(item.sale.createdAt) >= startOfDay) todayCost += cost;
   }
+
   const topProducts = Object.values(byProduct)
     .sort((a, b) => b.revenue - a.revenue)
     .slice(0, 5);
 
+  function paymentMap(rows) {
+    const m = { cash: 0, card: 0 };
+    for (const r of rows) m[r.paymentMethod] = r._sum.totalPrice ?? 0;
+    return m;
+  }
+
   res.json({
-    today:       { revenue: todayStats._sum.totalPrice   ?? 0, sales: todayStats._count.id   },
-    allTime:     { revenue: allTimeStats._sum.totalPrice ?? 0, sales: allTimeStats._count.id },
-    lowStock:    [...lowStockAccessories, ...outOfStockPhones],
+    today:    { revenue: todayStats._sum.totalPrice   ?? 0, sales: todayStats._count.id,   cost: todayCost,   payment: paymentMap(todayPayment)   },
+    allTime:  { revenue: allTimeStats._sum.totalPrice ?? 0, sales: allTimeStats._count.id, cost: allTimeCost, payment: paymentMap(allTimePayment) },
+    lowStock: [...lowStockAccessories, ...outOfStockPhones],
     topProducts,
   });
+});
+
+// GET /api/categories — all categories with their children
+app.get("/api/categories", async (req, res) => {
+  const categories = await prisma.category.findMany({
+    orderBy: { name: "asc" },
+    include: { children: { orderBy: { name: "asc" } } },
+  });
+  res.json(categories);
+});
+
+// POST /api/categories — create a new category or sub-category
+app.post("/api/categories", async (req, res) => {
+  const { name, parentId } = req.body;
+  if (!name) return res.status(400).json({ error: "name is required" });
+  const category = await prisma.category.create({
+    data: { name, parentId: parentId ? parseInt(parentId) : null },
+  });
+  res.status(201).json(category);
+});
+
+// DELETE /api/categories/:id
+app.delete("/api/categories/:id", async (req, res) => {
+  const id = parseInt(req.params.id);
+  try {
+    await prisma.$transaction(async (tx) => {
+      await tx.product.updateMany({ where: { categoryId: id }, data: { categoryId: null } });
+      await tx.category.updateMany({ where: { parentId: id }, data: { parentId: null } });
+      await tx.category.delete({ where: { id } });
+    });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// PATCH /api/sales/:saleId/items/:itemId/refund — refund one line item, restore stock
+app.patch("/api/sales/:saleId/items/:itemId/refund", async (req, res) => {
+  const saleId = parseInt(req.params.saleId);
+  const itemId = parseInt(req.params.itemId);
+  try {
+    const updated = await prisma.$transaction(async (tx) => {
+      const item = await tx.saleItem.findUnique({
+        where: { id: itemId },
+        include: { product: true },
+      });
+      if (!item)               throw new Error("Item not found");
+      if (item.saleId !== saleId) throw new Error("Item does not belong to this sale");
+      if (item.refunded)       throw new Error("Item already refunded");
+
+      await tx.saleItem.update({ where: { id: itemId }, data: { refunded: true } });
+
+      if (item.productUnitId) {
+        await tx.productUnit.update({ where: { id: item.productUnitId }, data: { status: "in_stock" } });
+      } else {
+        await tx.product.update({ where: { id: item.productId }, data: { quantity: { increment: item.quantity } } });
+      }
+
+      return tx.saleItem.findUnique({ where: { id: itemId } });
+    });
+    res.json(updated);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
 });
 
 // GET /api/sales — full sales history, newest first
@@ -106,7 +199,7 @@ app.get("/api/sales", async (req, res) => {
 // If customer.phone matches an existing customer, that customer is linked.
 // If not, a new customer row is created. Customer is always optional.
 app.post("/api/sales", async (req, res) => {
-  const { items, customer } = req.body;
+  const { items, customer, paymentMethod } = req.body;
 
   if (!Array.isArray(items) || items.length === 0) {
     return res.status(400).json({ error: "items must be a non-empty array" });
@@ -170,10 +263,14 @@ app.post("/api/sales", async (req, res) => {
       return tx.sale.create({
         data: {
           totalPrice,
+          paymentMethod: paymentMethod || "cash",
           customerId,
           items: { create: saleItemsData },
         },
-        include: { customer: true, items: true },
+        include: {
+          customer: true,
+          items: { include: { product: { select: { name: true } }, unit: { select: { imei: true } } } },
+        },
       });
     });
 
@@ -181,6 +278,50 @@ app.post("/api/sales", async (req, res) => {
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
+});
+
+// PATCH /api/customers/:id — update a customer's name, phone, or email
+app.patch("/api/customers/:id", async (req, res) => {
+  const id = parseInt(req.params.id);
+  const { name, phone, email } = req.body;
+  try {
+    const customer = await prisma.customer.update({
+      where: { id },
+      data: {
+        name:  name  ?? undefined,
+        phone: phone ?? undefined,
+        email: email ?? undefined,
+      },
+    });
+    res.json(customer);
+  } catch (err) {
+    if (err.code === "P2002") {
+      return res.status(400).json({ error: "That phone number is already linked to another customer" });
+    }
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// DELETE /api/customers/:id — remove a customer, unlinking their past sales (sales are kept)
+app.delete("/api/customers/:id", async (req, res) => {
+  const id = parseInt(req.params.id);
+  try {
+    await prisma.$transaction(async (tx) => {
+      await tx.sale.updateMany({ where: { customerId: id }, data: { customerId: null } });
+      await tx.customer.delete({ where: { id } });
+    });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// GET /api/customers/lookup?phone=xxx — find a single customer by exact phone number
+app.get("/api/customers/lookup", async (req, res) => {
+  const { phone } = req.query;
+  if (!phone) return res.json(null);
+  const customer = await prisma.customer.findUnique({ where: { phone } });
+  res.json(customer ?? null);
 });
 
 // GET /api/customers — all customers, each with stats and full purchase history
@@ -221,9 +362,30 @@ app.get("/api/customers", async (req, res) => {
   res.json(result);
 });
 
+// PATCH /api/products/:id — update an existing product's details
+app.patch("/api/products/:id", async (req, res) => {
+  const id = parseInt(req.params.id);
+  const { name, sellPrice, costPrice, upc, categoryId } = req.body;
+  try {
+    const product = await prisma.product.update({
+      where: { id },
+      data: {
+        name:       name       || undefined,
+        sellPrice:  sellPrice  != null ? parseFloat(sellPrice)  : undefined,
+        costPrice:  costPrice  != null ? parseFloat(costPrice)  : undefined,
+        upc:        upc        !== undefined ? (upc || null)     : undefined,
+        categoryId: categoryId !== undefined ? (categoryId ? parseInt(categoryId) : null) : undefined,
+      },
+    });
+    res.json(product);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
 // POST /api/products — create a brand-new product
 app.post("/api/products", async (req, res) => {
-  const { name, sellPrice, costPrice, upc, isSerialized, quantity } = req.body;
+  const { name, sellPrice, costPrice, upc, isSerialized, quantity, categoryId } = req.body;
   if (!name || sellPrice == null) {
     return res.status(400).json({ error: "name and sellPrice are required" });
   }
@@ -234,8 +396,8 @@ app.post("/api/products", async (req, res) => {
       costPrice:    parseFloat(costPrice ?? 0),
       upc:          upc || null,
       isSerialized: Boolean(isSerialized),
-      // phones track stock via units, not quantity
       quantity:     isSerialized ? 0 : parseInt(quantity ?? 0),
+      categoryId:   categoryId ? parseInt(categoryId) : null,
     },
   });
   res.status(201).json(product);
