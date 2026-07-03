@@ -8,7 +8,7 @@ generator client {
 }
 
 datasource db {
-  provider = "postgresql"
+  provider = "sqlserver"
   url      = env("DATABASE_URL")
 }
 
@@ -65,10 +65,10 @@ model SaleItem {
   id            Int          @id @default(autoincrement())
   sale          Sale         @relation(fields: [saleId], references: [id])
   saleId        Int
-  product       Product      @relation(fields: [productId], references: [id])
+  product       Product      @relation(fields: [productId], references: [id], onDelete: NoAction, onUpdate: NoAction)
   productId     Int
   // Only set for serialized phones; null for accessories.
-  unit          ProductUnit? @relation(fields: [productUnitId], references: [id])
+  unit          ProductUnit? @relation(fields: [productUnitId], references: [id], onDelete: NoAction, onUpdate: NoAction)
   productUnitId Int?         @unique
   unitPrice     Float
   quantity      Int          @default(1)
