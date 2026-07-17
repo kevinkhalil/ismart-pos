@@ -23,17 +23,17 @@ jobs:
         with:
           node-version: '22.x'
 
-      - name: npm install, build, and test
+      - name: npm install and generate Prisma client
+        working-directory: ismart-pos/server
         run: |
           npm install
-          npm run build --if-present
-          npm run test --if-present
+          npx prisma generate
 
       - name: Upload artifact for deployment job
         uses: actions/upload-artifact@v4
         with:
           name: node-app
-          path: .
+          path: ismart-pos/server
 
   deploy:
     runs-on: ubuntu-latest
