@@ -1,44 +1,265 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef, Component } from "react";
 import "./App.css";
+import { Chart, CategoryScale, LinearScale, BarElement, BarController, Tooltip } from "chart.js";
+Chart.register(CategoryScale, LinearScale, BarElement, BarController, Tooltip);
 
-const API = "http://localhost:3000";
+const API = import.meta.env.VITE_API_URL || "http://localhost:3000";
+
+// Holds the current session's JWT so every apiFetch call can attach it.
+// Not React state on purpose — it's read by helper functions outside the component tree.
+let authToken = null;
+
+function apiFetch(path, options = {}) {
+  const headers = { ...(options.headers || {}) };
+  if (authToken) headers.Authorization = `Bearer ${authToken}`;
+  return fetch(`${API}${path}`, { ...options, headers }).then(res => {
+    if (res.status === 401) {
+      authToken = null;
+      window.location.reload();
+    }
+    return res;
+  });
+}
+
+const ROLE_TABS = {
+  cashier: ["pos", "returns"],
+  manager: ["pos", "inventory", "sales", "customers", "reports", "returns"],
+  owner:   ["dashboard", "pos", "inventory", "sales", "customers", "reports", "returns", "users"],
+};
+
+const ROLE_LABELS = { owner: "Owner", manager: "Manager", cashier: "Cashier" };
+
+const ALL_TABS = [
+  { id: "dashboard", label: "Dashboard" },
+  { id: "pos",       label: "POS" },
+  { id: "inventory", label: "Inventory" },
+  { id: "sales",     label: "Sales" },
+  { id: "customers", label: "Customers" },
+  { id: "reports",   label: "Reports" },
+  { id: "returns",   label: "Returns" },
+  { id: "users",     label: "Users" },
+];
 
 export default function App() {
-  const [view, setView]         = useState("pos");
-  const [products, setProducts] = useState([]);
+  const [currentUser, setCurrentUser] = useState(null);
+  const [view, setView]               = useState("pos");
+  const [products, setProducts]       = useState([]);
 
   const loadProducts = useCallback(() => {
-    fetch(`${API}/api/products`)
+    apiFetch(`/api/products`)
       .then(r => r.json())
       .then(setProducts);
   }, []);
 
-  useEffect(() => { loadProducts(); }, [loadProducts]);
+  useEffect(() => { if (currentUser) loadProducts(); }, [loadProducts, currentUser]);
+
+  function handleLogin(user) {
+    authToken = user.token;
+    setCurrentUser(user);
+    setView(user.role === "owner" ? "dashboard" : "pos");
+  }
+
+  function handleLogout() {
+    authToken = null;
+    setCurrentUser(null);
+    setView("pos");
+    setProducts([]);
+  }
+
+  if (!currentUser) return <LoginScreen onLogin={handleLogin} />;
 
   const lowStockCount = products.filter(p =>
     p.isSerialized ? p.units.length === 0 : p.quantity <= 5
   ).length;
+
+  const visibleTabs = ALL_TABS.filter(t => ROLE_TABS[currentUser.role].includes(t.id));
 
   return (
     <div className="pos">
       <header className="pos-header">
         <h1>iSmart POS</h1>
         <nav className="tabs">
-          <button className={`tab ${view === "dashboard"  ? "active" : ""}`} onClick={() => setView("dashboard")}>Dashboard</button>
-          <button className={`tab ${view === "pos"        ? "active" : ""}`} onClick={() => setView("pos")}>POS</button>
-          <button className={`tab ${view === "inventory"  ? "active" : ""}`} onClick={() => setView("inventory")}>
-            Inventory{lowStockCount > 0 && <span className="nav-badge">{lowStockCount}</span>}
-          </button>
-          <button className={`tab ${view === "sales"      ? "active" : ""}`} onClick={() => setView("sales")}>Sales</button>
-          <button className={`tab ${view === "customers"  ? "active" : ""}`} onClick={() => setView("customers")}>Customers</button>
+          {visibleTabs.map(t => (
+            <button key={t.id} className={`tab ${view === t.id ? "active" : ""}`} onClick={() => setView(t.id)}>
+              {t.label}
+              {t.id === "inventory" && lowStockCount > 0 && <span className="nav-badge">{lowStockCount}</span>}
+            </button>
+          ))}
         </nav>
+        <div className="header-user">
+          <span className="header-user-name">{currentUser.name}</span>
+          <span className={`role-badge ${currentUser.role}`}>{ROLE_LABELS[currentUser.role]}</span>
+          <button className="btn-logout" onClick={handleLogout}>Sign out</button>
+        </div>
       </header>
 
       {view === "dashboard"  && <DashboardView />}
-      {view === "pos"        && <POSView       products={products} onSaleComplete={loadProducts} />}
+      {view === "pos"        && <POSView products={products} onSaleComplete={loadProducts} />}
       {view === "inventory"  && <InventoryView products={products} onStockUpdated={loadProducts} />}
       {view === "sales"      && <SalesView onRefund={loadProducts} />}
       {view === "customers"  && <CustomersView />}
+      {view === "reports"    && <ReportsErrorBoundary key="reports"><ReportsView /></ReportsErrorBoundary>}
+      {view === "returns"    && <ReturnsView onRefund={loadProducts} />}
+      {view === "users"      && <UsersView currentUserId={currentUser.id} />}
+
+      {(currentUser.role === "manager" || currentUser.role === "owner") && <ChatBot />}
+    </div>
+  );
+}
+
+// ─── Login Screen ─────────────────────────────────────────────────────────────
+
+function LoginScreen({ onLogin }) {
+  const [users, setUsers]               = useState(null);
+  const [selected, setSelected]         = useState(null);
+  const [pin, setPin]                   = useState("");
+  const [error, setError]               = useState("");
+  const [loading, setLoading]           = useState(false);
+
+  useEffect(() => {
+    apiFetch(`/api/users/list`)
+      .then(r => r.json())
+      .then(setUsers)
+      .catch(() => setUsers([]));
+  }, []);
+
+  function appendPin(digit) {
+    if (pin.length >= 6) return;
+    setPin(p => p + digit);
+    setError("");
+  }
+
+  function backspace() {
+    setPin(p => p.slice(0, -1));
+    setError("");
+  }
+
+  async function submitPin() {
+    if (!pin || loading) return;
+    setLoading(true);
+    try {
+      const res  = await apiFetch(`/api/auth/login`, {
+        method:  "POST",
+        headers: { "Content-Type": "application/json" },
+        body:    JSON.stringify({ userId: selected.id, pin }),
+      });
+      const data = await res.json();
+      if (!res.ok) { setError("Incorrect PIN"); setPin(""); }
+      else onLogin(data);
+    } catch {
+      setError("Connection error");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  if (users === null) {
+    return (
+      <div className="login-screen">
+        <div className="login-card"><div className="login-logo">iSmart POS</div><p className="login-subtitle">Loading…</p></div>
+      </div>
+    );
+  }
+
+  if (users.length === 0) return <SetupScreen onSetupComplete={onLogin} />;
+
+  if (selected) {
+    return (
+      <div className="login-screen">
+        <div className="login-card">
+          <div className="login-logo">iSmart POS</div>
+          <div className="login-selected-name">{selected.name}</div>
+          <button className="btn-switch-user" onClick={() => { setSelected(null); setPin(""); setError(""); }}>← Switch user</button>
+          <div className="pin-dots">
+            {[...Array(6)].map((_, i) => (
+              <div key={i} className={`pin-dot ${i < pin.length ? "filled" : ""}`} />
+            ))}
+          </div>
+          {error && <div className="pin-error">{error}</div>}
+          <div className="pin-pad">
+            {[1,2,3,4,5,6,7,8,9].map(n => (
+              <button key={n} className="pin-btn" onClick={() => appendPin(String(n))}>{n}</button>
+            ))}
+            <button className="pin-btn pin-back" onClick={backspace}>⌫</button>
+            <button className="pin-btn" onClick={() => appendPin("0")}>0</button>
+            <button className="pin-btn pin-enter" onClick={submitPin} disabled={!pin || loading}>
+              {loading ? "…" : "→"}
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="login-screen">
+      <div className="login-card">
+        <div className="login-logo">iSmart POS</div>
+        <p className="login-subtitle">Who's signing in?</p>
+        <div className="user-tiles">
+          {users.map(u => (
+            <button key={u.id} className="user-tile" onClick={() => setSelected(u)}>
+              <div className="user-tile-avatar">{u.name.charAt(0).toUpperCase()}</div>
+              <div className="user-tile-name">{u.name}</div>
+              <div className={`user-tile-role ${u.role}`}>{ROLE_LABELS[u.role]}</div>
+            </button>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Setup Screen (first time only) ───────────────────────────────────────────
+
+function SetupScreen({ onSetupComplete }) {
+  const [form, setForm]     = useState({ name: "", pin: "", confirm: "" });
+  const [error, setError]   = useState("");
+  const [loading, setLoading] = useState(false);
+
+  async function handleSubmit(e) {
+    e.preventDefault();
+    if (!/^\d{4,6}$/.test(form.pin))       return setError("PIN must be 4–6 digits (numbers only)");
+    if (form.pin !== form.confirm)          return setError("PINs don't match");
+    setLoading(true); setError("");
+    try {
+      const res  = await apiFetch(`/api/auth/setup`, {
+        method:  "POST",
+        headers: { "Content-Type": "application/json" },
+        body:    JSON.stringify({ name: form.name, pin: form.pin }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error);
+      onSetupComplete(data);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <div className="login-screen">
+      <div className="login-card setup-card">
+        <div className="login-logo">iSmart POS</div>
+        <p className="login-subtitle">Welcome! Create your owner account to get started.</p>
+        {error && <div className="pin-error">{error}</div>}
+        <form onSubmit={handleSubmit} className="setup-form">
+          <div className="form-group">
+            <label>Your name</label>
+            <input value={form.name} onChange={e => setForm(p => ({ ...p, name: e.target.value }))} placeholder="e.g. Store Owner" required />
+          </div>
+          <div className="form-group">
+            <label>PIN (4–6 digits)</label>
+            <input type="password" inputMode="numeric" maxLength={6} value={form.pin} onChange={e => setForm(p => ({ ...p, pin: e.target.value }))} placeholder="••••" required />
+          </div>
+          <div className="form-group">
+            <label>Confirm PIN</label>
+            <input type="password" inputMode="numeric" maxLength={6} value={form.confirm} onChange={e => setForm(p => ({ ...p, confirm: e.target.value }))} placeholder="••••" required />
+          </div>
+          <button className="btn-submit" disabled={loading}>{loading ? "Creating…" : "Create Account & Sign In"}</button>
+        </form>
+      </div>
     </div>
   );
 }
@@ -46,14 +267,32 @@ export default function App() {
 // ─── Dashboard View ──────────────────────────────────────────────────────────
 
 function DashboardView() {
-  const [data, setData]       = useState(null);
-  const [loading, setLoading] = useState(true);
+  const [data, setData]               = useState(null);
+  const [loading, setLoading]         = useState(true);
+  const [reporting, setReporting]     = useState(false);
+  const [reportMsg, setReportMsg]     = useState(null);
 
   function load() {
     setLoading(true);
-    fetch(`${API}/api/dashboard`)
+    apiFetch(`/api/dashboard`)
       .then(r => r.json())
       .then(d => { setData(d); setLoading(false); });
+  }
+
+  async function sendOwnerReport() {
+    setReporting(true);
+    setReportMsg(null);
+    try {
+      const res  = await apiFetch(`/api/reports/owner`, { method: "POST" });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error);
+      setReportMsg({ type: "ok", text: "Report sent to owner successfully!" });
+    } catch (err) {
+      setReportMsg({ type: "error", text: `Failed: ${err.message}` });
+    } finally {
+      setReporting(false);
+      setTimeout(() => setReportMsg(null), 4000);
+    }
   }
 
   useEffect(() => { load(); }, []);
@@ -69,6 +308,14 @@ function DashboardView() {
 
   return (
     <div className="dashboard-view">
+
+      {/* ── Owner report button ── */}
+      <div className="dashboard-report-row">
+        <button className="btn-owner-report" onClick={sendOwnerReport} disabled={reporting}>
+          {reporting ? "Sending…" : "Send Owner Report"}
+        </button>
+        {reportMsg && <span className={`report-msg ${reportMsg.type}`}>{reportMsg.text}</span>}
+      </div>
 
       {/* ── Stat cards ── */}
       <div className="stat-cards">
@@ -203,6 +450,8 @@ function POSView({ products, onSaleComplete }) {
   const [saleError, setSaleError]   = useState(null);
   const [loading, setLoading]         = useState(false);
   const [paymentMethod, setPaymentMethod] = useState("cash");
+  const [discountType, setDiscountType]   = useState("pct");
+  const [discountValue, setDiscountValue] = useState("");
   const [barcodeVal, setBarcodeVal]   = useState("");
   const [scanMsg, setScanMsg]         = useState(null);
   const [categories, setCategories]   = useState([]);
@@ -210,7 +459,7 @@ function POSView({ products, onSaleComplete }) {
   const [selectedSubId, setSelectedSubId]       = useState(null);
 
   useEffect(() => {
-    fetch(`${API}/api/categories`).then(r => r.json()).then(setCategories);
+    apiFetch(`/api/categories`).then(r => r.json()).then(setCategories);
   }, []);
 
   const fullPhone = customer.phone ? `${countryCode}${customer.phone}` : "";
@@ -228,7 +477,7 @@ function POSView({ products, onSaleComplete }) {
   useEffect(() => {
     if (!fullPhone || customer.phone.length < 6) { setReturning(null); return; }
     const timer = setTimeout(async () => {
-      const res   = await fetch(`${API}/api/customers/lookup?phone=${encodeURIComponent(fullPhone)}`);
+      const res   = await apiFetch(`/api/customers/lookup?phone=${encodeURIComponent(fullPhone)}`);
       const found = await res.json();
       if (found) {
         setReturning(found);
@@ -282,7 +531,13 @@ function POSView({ products, onSaleComplete }) {
     setTimeout(() => setScanMsg(null), 1500);
   }
 
-  const total = cart.reduce((sum, i) => sum + i.product.sellPrice * i.quantity, 0);
+  const subtotal       = cart.reduce((sum, i) => sum + i.product.sellPrice * i.quantity, 0);
+  const discountAmount = discountValue && parseFloat(discountValue) > 0
+    ? discountType === "pct"
+      ? subtotal * (parseFloat(discountValue) / 100)
+      : Math.min(parseFloat(discountValue), subtotal)
+    : 0;
+  const total = Math.max(0, subtotal - discountAmount);
 
   async function completeSale() {
     setSaleError(null);
@@ -294,16 +549,19 @@ function POSView({ products, onSaleComplete }) {
         : { productId: i.product.id, quantity: i.quantity }
     );
 
-    // Only send customer if at least a name or phone was entered
     const customerPayload = (customer.name || fullPhone)
       ? { name: customer.name, phone: fullPhone || undefined, email: customer.email || undefined }
       : undefined;
 
+    const discountPayload = discountAmount > 0
+      ? { type: discountType, value: parseFloat(discountValue) }
+      : undefined;
+
     try {
-      const res  = await fetch(`${API}/api/sales`, {
+      const res  = await apiFetch(`/api/sales`, {
         method:  "POST",
         headers: { "Content-Type": "application/json" },
-        body:    JSON.stringify({ items, customer: customerPayload, paymentMethod }),
+        body:    JSON.stringify({ items, customer: customerPayload, paymentMethod, discount: discountPayload }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error);
@@ -313,6 +571,8 @@ function POSView({ products, onSaleComplete }) {
       setCustomer({ name: "", phone: "", email: "" });
       setReturning(null);
       setPaymentMethod("cash");
+      setDiscountValue("");
+      setDiscountType("pct");
       onSaleComplete();
     } catch (err) {
       setSaleError(err.message);
@@ -481,6 +741,35 @@ function POSView({ products, onSaleComplete }) {
               ))}
             </ul>
 
+            <div className="discount-row">
+              <div className="discount-type-toggle">
+                <button type="button" className={discountType === "pct"   ? "active" : ""} onClick={() => { setDiscountType("pct");   setDiscountValue(""); }}>%</button>
+                <button type="button" className={discountType === "fixed" ? "active" : ""} onClick={() => { setDiscountType("fixed"); setDiscountValue(""); }}>$</button>
+              </div>
+              <input
+                className="discount-input"
+                type="number"
+                min="0"
+                max={discountType === "pct" ? 100 : undefined}
+                step="0.01"
+                placeholder={discountType === "pct" ? "Discount %" : "Discount $"}
+                value={discountValue}
+                onChange={e => setDiscountValue(e.target.value)}
+              />
+            </div>
+
+            {discountAmount > 0 && (
+              <div className="cart-subtotal-row">
+                <span>Subtotal</span><span>${subtotal.toFixed(2)}</span>
+              </div>
+            )}
+            {discountAmount > 0 && (
+              <div className="cart-discount-row">
+                <span>Discount {discountType === "pct" ? `(${parseFloat(discountValue)}%)` : ""}</span>
+                <span>− ${discountAmount.toFixed(2)}</span>
+              </div>
+            )}
+
             <div className="cart-total">
               <span>Total</span>
               <span>${total.toFixed(2)}</span>
@@ -566,7 +855,7 @@ function InventoryView({ products, onStockUpdated }) {
   const [categories, setCategories] = useState([]);
 
   function loadCategories() {
-    fetch(`${API}/api/categories`).then(r => r.json()).then(setCategories);
+    apiFetch(`/api/categories`).then(r => r.json()).then(setCategories);
   }
 
   useEffect(() => { loadCategories(); }, []);
@@ -597,7 +886,7 @@ function NewProductForm({ onStockUpdated, categories }) {
     e.preventDefault();
     setLoading(true); setError(""); setSuccess("");
     try {
-      const res     = await fetch(`${API}/api/products`, {
+      const res     = await apiFetch(`/api/products`, {
         method:  "POST",
         headers: { "Content-Type": "application/json" },
         body:    JSON.stringify({ name: form.name, sellPrice: form.sellPrice, costPrice: form.costPrice, upc: form.upc, isSerialized: form.isSerialized, quantity: form.quantity, categoryId: form.categoryId || null }),
@@ -606,7 +895,7 @@ function NewProductForm({ onStockUpdated, categories }) {
       if (!res.ok) throw new Error(product.error);
 
       if (form.isSerialized && form.imei) {
-        const unitRes = await fetch(`${API}/api/products/${product.id}/units`, {
+        const unitRes = await apiFetch(`/api/products/${product.id}/units`, {
           method:  "POST",
           headers: { "Content-Type": "application/json" },
           body:    JSON.stringify({ imei: form.imei, costPrice: form.costPrice }),
@@ -705,7 +994,7 @@ function AddStockForm({ products, onStockUpdated }) {
     setLoading(true); setError(""); setSuccess("");
     try {
       if (selected.isSerialized) {
-        const res  = await fetch(`${API}/api/products/${selected.id}/units`, {
+        const res  = await apiFetch(`/api/products/${selected.id}/units`, {
           method: "POST", headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ imei, costPrice }),
         });
@@ -713,7 +1002,7 @@ function AddStockForm({ products, onStockUpdated }) {
         if (!res.ok) throw new Error(data.error);
         setSuccess(`IMEI ${data.imei} added to ${selected.name}`);
       } else {
-        const res  = await fetch(`${API}/api/products/${selected.id}/stock`, {
+        const res  = await apiFetch(`/api/products/${selected.id}/stock`, {
           method: "PATCH", headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ quantity }),
         });
@@ -789,7 +1078,7 @@ function EditProductForm({ products, onStockUpdated, categories }) {
     e.preventDefault();
     setLoading(true); setError(""); setSuccess("");
     try {
-      const res  = await fetch(`${API}/api/products/${selected.id}`, {
+      const res  = await apiFetch(`/api/products/${selected.id}`, {
         method:  "PATCH",
         headers: { "Content-Type": "application/json" },
         body:    JSON.stringify(form),
@@ -874,7 +1163,7 @@ function CategoryManager({ categories, onChanged }) {
     e.preventDefault();
     setLoading(true); setError("");
     try {
-      const res  = await fetch(`${API}/api/categories`, {
+      const res  = await apiFetch(`/api/categories`, {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ name, parentId: parentId || null }),
       });
@@ -890,7 +1179,7 @@ function CategoryManager({ categories, onChanged }) {
   }
 
   async function handleDelete(id) {
-    await fetch(`${API}/api/categories/${id}`, { method: "DELETE" });
+    await apiFetch(`/api/categories/${id}`, { method: "DELETE" });
     onChanged();
   }
 
@@ -950,7 +1239,7 @@ function CustomersView() {
   const [loading, setLoading]     = useState(true);
 
   function load() {
-    fetch(`${API}/api/customers`)
+    apiFetch(`/api/customers`)
       .then(r => r.json())
       .then(data => { setCustomers(data); setLoading(false); });
   }
@@ -977,7 +1266,7 @@ function CustomersView() {
   async function deleteCustomer(id, e) {
     e.stopPropagation();
     try {
-      const res  = await fetch(`${API}/api/customers/${id}`, { method: "DELETE" });
+      const res  = await apiFetch(`/api/customers/${id}`, { method: "DELETE" });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error);
       setConfirmDelete(null);
@@ -992,7 +1281,7 @@ function CustomersView() {
     setEditLoading(true);
     setEditError("");
     try {
-      const res  = await fetch(`${API}/api/customers/${id}`, {
+      const res  = await apiFetch(`/api/customers/${id}`, {
         method:  "PATCH",
         headers: { "Content-Type": "application/json" },
         body:    JSON.stringify(editForm),
@@ -1143,14 +1432,54 @@ function SalesView({ onRefund }) {
   const [expanded, setExpanded]     = useState(null);
   const [loading, setLoading]       = useState(true);
   const [confirmRefund, setConfirmRefund] = useState(null);
+  const [dateFrom, setDateFrom]     = useState("");
+  const [dateTo, setDateTo]         = useState("");
+  const [activePreset, setActivePreset] = useState("all");
 
-  function load() {
-    fetch(`${API}/api/sales`)
+  // Use local date parts — toISOString() is UTC and gives the wrong date in UTC+ timezones
+  function localStr(date) {
+    const y = date.getFullYear();
+    const m = String(date.getMonth() + 1).padStart(2, "0");
+    const d = String(date.getDate()).padStart(2, "0");
+    return `${y}-${m}-${d}`;
+  }
+
+  function load(from, to) {
+    setLoading(true);
+    const params = new URLSearchParams();
+    if (from) params.set("from", from);
+    if (to)   params.set("to",   to);
+    const qs  = params.toString();
+    apiFetch(`/api/sales${qs ? "?" + qs : ""}`)
       .then(r => r.json())
       .then(data => { setSales(data); setLoading(false); });
   }
 
-  useEffect(() => { load(); }, []);
+  useEffect(() => { load(dateFrom, dateTo); }, [dateFrom, dateTo]);
+
+  function setPreset(preset) {
+    setActivePreset(preset);
+    const today    = new Date();
+    const todayStr = localStr(today);
+    if (preset === "today") {
+      setDateFrom(todayStr); setDateTo(todayStr);
+    } else if (preset === "week") {
+      const start = new Date(today);
+      start.setDate(today.getDate() - today.getDay());
+      setDateFrom(localStr(start)); setDateTo(todayStr);
+    } else if (preset === "month") {
+      const start = new Date(today.getFullYear(), today.getMonth(), 1);
+      setDateFrom(localStr(start)); setDateTo(todayStr);
+    } else {
+      setDateFrom(""); setDateTo("");
+    }
+  }
+
+  function handleManualDate(field, value) {
+    setActivePreset("custom");
+    if (field === "from") setDateFrom(value);
+    else setDateTo(value);
+  }
 
   function toggleExpand(id) { setExpanded(prev => prev === id ? null : id); }
 
@@ -1163,23 +1492,93 @@ function SalesView({ onRefund }) {
 
   async function refundItem(saleId, itemId) {
     try {
-      const res  = await fetch(`${API}/api/sales/${saleId}/items/${itemId}/refund`, { method: "PATCH" });
+      const res  = await apiFetch(`/api/sales/${saleId}/items/${itemId}/refund`, { method: "PATCH" });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error);
       setConfirmRefund(null);
-      load();
+      load(dateFrom, dateTo);
       onRefund();
     } catch (err) {
       alert("Refund failed: " + err.message);
     }
   }
 
+  function exportCSV() {
+    const rows = [["Sale ID", "Date", "Customer", "Phone", "Email", "Payment", "Total ($)", "Items"]];
+    for (const sale of sales) {
+      const date     = new Date(sale.createdAt).toLocaleString();
+      const customer = sale.customer?.name  || "Walk-in";
+      const phone    = sale.customer?.phone || "";
+      const email    = sale.customer?.email || "";
+      const items    = sale.items.map(i => `${i.product.name} x${i.quantity}`).join("; ");
+      rows.push([sale.id, date, customer, phone, email, sale.paymentMethod, sale.totalPrice.toFixed(2), items]);
+    }
+    const csv  = rows.map(r => r.map(v => `"${String(v).replace(/"/g, '""')}"`).join(",")).join("\n");
+    const blob = new Blob([csv], { type: "text/csv" });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement("a");
+    a.href     = url;
+    a.download = `ismart-sales-${new Date().toISOString().slice(0, 10)}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+
+  const filteredRevenue = sales.reduce((sum, s) => sum + s.totalPrice, 0);
+  const isFiltered      = dateFrom || dateTo;
+
+  function rangeLabel() {
+    if (!dateFrom && !dateTo) return "All sales";
+    const fmt = iso => new Date(iso + "T00:00:00").toLocaleDateString([], { month: "short", day: "numeric", year: "numeric" });
+    if (dateFrom && dateTo) return `${fmt(dateFrom)} – ${fmt(dateTo)}`;
+    if (dateFrom)           return `From ${fmt(dateFrom)}`;
+    return `Up to ${fmt(dateTo)}`;
+  }
+
   return (
     <div className="sales-view">
-      <h2>Sales History</h2>
+      <div className="sales-view-header">
+        <h2>Sales History</h2>
+        {sales.length > 0 && (
+          <button className="btn-export-csv" onClick={exportCSV}>Export CSV</button>
+        )}
+      </div>
+
+      {/* ── Date filter bar ── */}
+      <div className="sales-filter-bar">
+        <div className="sales-preset-btns">
+          <button className={`preset-btn ${activePreset === "all"   ? "active" : ""}`} onClick={() => setPreset("all")}>All time</button>
+          <button className={`preset-btn ${activePreset === "today" ? "active" : ""}`} onClick={() => setPreset("today")}>Today</button>
+          <button className={`preset-btn ${activePreset === "week"  ? "active" : ""}`} onClick={() => setPreset("week")}>This week</button>
+          <button className={`preset-btn ${activePreset === "month" ? "active" : ""}`} onClick={() => setPreset("month")}>This month</button>
+        </div>
+        <div className="sales-date-inputs">
+          <label>From
+            <input type="date" value={dateFrom} onChange={e => handleManualDate("from", e.target.value)} />
+          </label>
+          <label>To
+            <input type="date" value={dateTo} onChange={e => handleManualDate("to", e.target.value)} />
+          </label>
+          {isFiltered && (
+            <button className="btn-clear-filter" onClick={() => setPreset("all")}>Clear</button>
+          )}
+        </div>
+      </div>
+
+      {/* ── Summary row ── */}
+      {!loading && (
+        <div className="sales-summary">
+          <span className="sales-summary-range">{rangeLabel()}</span>
+          <span className="sales-summary-count">{sales.length} {sales.length === 1 ? "sale" : "sales"}</span>
+          {sales.length > 0 && (
+            <span className="sales-summary-revenue">Total: <strong>${filteredRevenue.toFixed(2)}</strong></span>
+          )}
+        </div>
+      )}
 
       {loading && <p className="sales-empty">Loading…</p>}
-      {!loading && sales.length === 0 && <p className="sales-empty">No sales yet.</p>}
+      {!loading && sales.length === 0 && <p className="sales-empty">{isFiltered ? "No sales in this date range." : "No sales yet."}</p>}
 
       <ul className="sales-list">
         {sales.map(sale => (
@@ -1232,5 +1631,597 @@ function SalesView({ onRefund }) {
         ))}
       </ul>
     </div>
+  );
+}
+
+// ─── Returns View ─────────────────────────────────────────────────────────────
+
+function ReturnsView({ onRefund }) {
+  const [query, setQuery]         = useState("");
+  const [results, setResults]     = useState(null);
+  const [searching, setSearching] = useState(false);
+  const [searchErr, setSearchErr] = useState("");
+  const [selected, setSelected]   = useState(null);
+  const [confirmId, setConfirmId] = useState(null);
+  const [processing, setProcessing] = useState(false);
+  const [doneMsg, setDoneMsg]     = useState("");
+
+  async function handleSearch(e) {
+    e.preventDefault();
+    const q = query.trim();
+    if (!q) return;
+    setSearching(true); setSearchErr(""); setResults(null); setSelected(null); setDoneMsg("");
+    try {
+      // Try as Sale ID first, then fall back to customer name search
+      const params = new URLSearchParams({ q });
+      const res  = await apiFetch(`/api/returns/search?${params}`);
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error);
+      setResults(data);
+      if (data.length === 0) setSearchErr("No sales found. Try a Sale ID or customer name.");
+    } catch (err) {
+      setSearchErr(err.message);
+    } finally {
+      setSearching(false);
+    }
+  }
+
+  async function refundItem(saleId, itemId) {
+    setProcessing(true);
+    try {
+      const res  = await apiFetch(`/api/sales/${saleId}/items/${itemId}/refund`, { method: "PATCH" });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error);
+      setConfirmId(null);
+      setDoneMsg("Item refunded — stock restored.");
+      // Refresh the selected sale
+      const refreshRes  = await apiFetch(`/api/returns/search?q=${encodeURIComponent(String(saleId))}`);
+      const refreshData = await refreshRes.json();
+      if (refreshRes.ok) {
+        setResults(refreshData);
+        setSelected(refreshData.find(s => s.id === saleId) ?? null);
+      }
+      onRefund();
+      setTimeout(() => setDoneMsg(""), 3000);
+    } catch (err) {
+      alert("Refund failed: " + err.message);
+    } finally {
+      setProcessing(false);
+    }
+  }
+
+  function formatDate(iso) {
+    return new Date(iso).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+  }
+
+  return (
+    <div className="returns-view">
+      <div className="returns-header">
+        <h2>Process Return</h2>
+        <p className="returns-subtitle">Search by Sale ID or customer name to find and refund items.</p>
+      </div>
+
+      {/* Search bar */}
+      <form className="returns-search-form" onSubmit={handleSearch}>
+        <input
+          className="returns-search-input"
+          placeholder="Sale ID (e.g. 42) or customer name…"
+          value={query}
+          onChange={e => setQuery(e.target.value)}
+        />
+        <button className="btn-submit returns-search-btn" disabled={searching || !query.trim()}>
+          {searching ? "Searching…" : "Search"}
+        </button>
+      </form>
+
+      {searchErr && <p className="returns-error">{searchErr}</p>}
+      {doneMsg   && <p className="returns-success">{doneMsg}</p>}
+
+      {/* Results list */}
+      {results && !selected && (
+        <ul className="returns-results">
+          {results.map(sale => (
+            <li key={sale.id} className="returns-result-card" onClick={() => setSelected(sale)}>
+              <div className="returns-result-left">
+                <span className="returns-result-id">Sale #{sale.id}</span>
+                <span className="returns-result-date">{formatDate(sale.createdAt)}</span>
+              </div>
+              <span className="returns-result-customer">
+                {sale.customer ? sale.customer.name : "Walk-in"}
+              </span>
+              <span className="returns-result-total">${sale.totalPrice.toFixed(2)}</span>
+              <span className="returns-result-arrow">→</span>
+            </li>
+          ))}
+        </ul>
+      )}
+
+      {/* Selected sale detail */}
+      {selected && (
+        <div className="returns-detail">
+          <div className="returns-detail-header">
+            <div>
+              <span className="returns-result-id">Sale #{selected.id}</span>
+              <span className="returns-result-date" style={{ marginLeft: 10 }}>{formatDate(selected.createdAt)}</span>
+              {selected.customer && <span className="returns-result-customer" style={{ marginLeft: 10 }}>— {selected.customer.name}</span>}
+            </div>
+            <button className="btn-cancel-edit" onClick={() => { setSelected(null); setConfirmId(null); }}>← Back to results</button>
+          </div>
+
+          <ul className="returns-items-list">
+            {selected.items.map(item => (
+              <li key={item.id} className={`returns-item-row ${item.refunded ? "refunded" : ""}`}>
+                <div className="returns-item-info">
+                  <span className="returns-item-name">{item.product?.name || "Item"}</span>
+                  {item.unit && <span className="returns-item-imei">IMEI {item.unit.imei}</span>}
+                  {item.quantity > 1 && <span className="returns-item-qty">×{item.quantity}</span>}
+                </div>
+                <div className="returns-item-right">
+                  <span className="returns-item-price">${(item.unitPrice * item.quantity).toFixed(2)}</span>
+                  {item.refunded ? (
+                    <span className="refund-badge">Refunded</span>
+                  ) : confirmId === item.id ? (
+                    <div className="refund-confirm">
+                      <span>Confirm refund?</span>
+                      <button className="btn-confirm-refund" onClick={() => refundItem(selected.id, item.id)} disabled={processing}>
+                        {processing ? "…" : "Yes, refund"}
+                      </button>
+                      <button className="btn-cancel-refund" onClick={() => setConfirmId(null)}>Cancel</button>
+                    </div>
+                  ) : (
+                    <button className="btn-refund" onClick={() => setConfirmId(item.id)}>Refund</button>
+                  )}
+                </div>
+              </li>
+            ))}
+          </ul>
+
+          <div className="returns-total-row">
+            <span>Sale total</span>
+            <span>${selected.totalPrice.toFixed(2)}</span>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Reports View ─────────────────────────────────────────────────────────────
+
+class ReportsErrorBoundary extends Component {
+  state = { err: null };
+  static getDerivedStateFromError(err) { return { err }; }
+  render() {
+    if (this.state.err) return (
+      <div className="reports-view">
+        <p className="reports-empty" style={{ color: "var(--color-error,#ef4444)", fontFamily: "monospace", fontSize: 13 }}>
+          Reports error — {this.state.err.message}
+        </p>
+        <button className="btn-submit" style={{ marginTop: 12 }} onClick={() => this.setState({ err: null })}>
+          Retry
+        </button>
+      </div>
+    );
+    return this.props.children;
+  }
+}
+
+function RevenueChart({ daily }) {
+  const canvasRef = useRef(null);
+  const chartRef  = useRef(null);
+
+  // Create chart once on mount, destroy on unmount
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    Chart.getChart(canvas)?.destroy();
+
+    const dark      = window.matchMedia("(prefers-color-scheme: dark)").matches;
+    const tickColor = dark ? "#94a3b8" : "#64748b";
+    const gridColor = dark ? "#334155" : "#f1f5f9";
+
+    chartRef.current = new Chart(canvas.getContext("2d"), {
+      type: "bar",
+      data: {
+        labels:   [],
+        datasets: [{ data: [], backgroundColor: "#2563eb", hoverBackgroundColor: "#1d4ed8", borderRadius: 4, borderSkipped: false }],
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        plugins: {
+          legend:  { display: false },
+          tooltip: { callbacks: { label: c => ` $${Number(c.raw).toFixed(2)}` } },
+        },
+        scales: {
+          x: { grid: { display: false }, ticks: { color: tickColor, maxTicksLimit: 12, maxRotation: 45 } },
+          y: { beginAtZero: true, grid: { color: gridColor }, ticks: { color: tickColor, callback: v => `$${v}` } },
+        },
+      },
+    });
+
+    return () => {
+      chartRef.current?.destroy();
+      chartRef.current = null;
+    };
+  }, []);
+
+  // Update data imperatively whenever daily changes
+  useEffect(() => {
+    const chart = chartRef.current;
+    if (!chart) return;
+    chart.data.labels = daily.map(d =>
+      new Date(d.date + "T12:00:00").toLocaleDateString([], { month: "short", day: "numeric" })
+    );
+    chart.data.datasets[0].data = daily.map(d => parseFloat(Number(d.revenue).toFixed(2)));
+    chart.update();
+  }, [daily]);
+
+  return <div className="reports-chart-wrap"><canvas ref={canvasRef} /></div>;
+}
+
+function ReportsFilterBar({ dateFrom, dateTo, activePreset, onPreset, onFromChange, onToChange }) {
+  return (
+    <div className="sales-filter-bar">
+      <div className="sales-preset-btns">
+        {[["7days","Last 7 days"],["30days","Last 30 days"],["month","This month"],["year","This year"]].map(([id, label]) => (
+          <button key={id} className={`preset-btn ${activePreset === id ? "active" : ""}`} onClick={() => onPreset(id)}>{label}</button>
+        ))}
+      </div>
+      <div className="sales-date-inputs">
+        <label>From <input type="date" value={dateFrom} onChange={e => onFromChange(e.target.value)} /></label>
+        <label>To   <input type="date" value={dateTo}   onChange={e => onToChange(e.target.value)}   /></label>
+      </div>
+    </div>
+  );
+}
+
+function ReportsView() {
+  const [data, setData]         = useState(null);
+  const [loading, setLoading]   = useState(true);
+  const [fetchError, setFetchError] = useState(null);
+  const [dateFrom, setDateFrom] = useState("");
+  const [dateTo, setDateTo]     = useState("");
+  const [activePreset, setActivePreset] = useState("30days");
+
+  function localStr(date) {
+    return `${date.getFullYear()}-${String(date.getMonth()+1).padStart(2,"0")}-${String(date.getDate()).padStart(2,"0")}`;
+  }
+
+  function applyPreset(preset) {
+    setActivePreset(preset);
+    const today = new Date();
+    const str   = localStr(today);
+    if (preset === "7days") {
+      const s = new Date(today); s.setDate(today.getDate() - 6);
+      setDateFrom(localStr(s)); setDateTo(str);
+    } else if (preset === "30days") {
+      const s = new Date(today); s.setDate(today.getDate() - 29);
+      setDateFrom(localStr(s)); setDateTo(str);
+    } else if (preset === "month") {
+      setDateFrom(localStr(new Date(today.getFullYear(), today.getMonth(), 1))); setDateTo(str);
+    } else if (preset === "year") {
+      setDateFrom(localStr(new Date(today.getFullYear(), 0, 1))); setDateTo(str);
+    }
+  }
+
+  useEffect(() => { applyPreset("30days"); }, []);
+
+  useEffect(() => {
+    if (!dateFrom) return;
+    setLoading(true);
+    setFetchError(null);
+    apiFetch(`/api/reports/analytics?from=${dateFrom}&to=${dateTo}`)
+      .then(r => {
+        if (!r.ok) throw new Error(`Server error ${r.status}`);
+        return r.json();
+      })
+      .then(d => { setData(d); setLoading(false); })
+      .catch(err => { setFetchError(err.message); setLoading(false); });
+  }, [dateFrom, dateTo]);
+
+
+  const { summary, daily, topProducts, payment } = data ?? { summary: {}, daily: [], topProducts: [], payment: {} };
+  const totalPayment = (payment.cash ?? 0) + (payment.card ?? 0);
+  const cashPct      = totalPayment > 0 ? ((payment.cash ?? 0) / totalPayment) * 100 : 0;
+  const cardPct      = 100 - cashPct;
+
+  return (
+    <div className="reports-view">
+      <ReportsFilterBar
+        dateFrom={dateFrom} dateTo={dateTo} activePreset={activePreset}
+        onPreset={applyPreset}
+        onFromChange={v => { setActivePreset("custom"); setDateFrom(v); }}
+        onToChange={v   => { setActivePreset("custom"); setDateTo(v);   }}
+      />
+
+      {fetchError && <p className="reports-empty" style={{ color: "var(--color-error, #ef4444)" }}>Failed to load: {fetchError}</p>}
+      {loading ? <p className="reports-empty">Loading…</p> : fetchError ? null : (
+        <>
+          {/* Stat cards */}
+          <div className="reports-stat-cards">
+            <div className="reports-stat-card">
+              <span className="reports-stat-label">Total Revenue</span>
+              <span className="reports-stat-value">${(summary.totalRevenue ?? 0).toFixed(2)}</span>
+            </div>
+            <div className="reports-stat-card">
+              <span className="reports-stat-label">Total Sales</span>
+              <span className="reports-stat-value">{summary.totalSales ?? 0}</span>
+            </div>
+            <div className="reports-stat-card">
+              <span className="reports-stat-label">Avg Order</span>
+              <span className="reports-stat-value">${(summary.avgOrderValue ?? 0).toFixed(2)}</span>
+            </div>
+          </div>
+
+          {/* Revenue trend chart */}
+          <div className="reports-chart-card">
+            <h3 className="reports-card-title">Revenue Trend</h3>
+            {(summary.totalSales ?? 0) === 0 ? (
+              <p className="reports-empty-chart">No sales in this period.</p>
+            ) : (
+              <RevenueChart daily={data.daily} />
+            )}
+          </div>
+
+          {/* Bottom grid */}
+          <div className="reports-bottom-grid">
+            <div className="reports-card">
+              <h3 className="reports-card-title">Top Products</h3>
+              {topProducts.length === 0 ? (
+                <p className="reports-empty">No sales in this period.</p>
+              ) : (
+                <ul className="reports-top-products">
+                  {topProducts.map((p, i) => (
+                    <li key={p.name} className="reports-top-product-row">
+                      <span className="reports-rank">#{i + 1}</span>
+                      <span className="reports-product-name">{p.name}</span>
+                      <div className="reports-product-stats">
+                        <span className="reports-product-revenue">${p.revenue.toFixed(2)}</span>
+                        <span className="reports-product-units">{p.unitsSold} sold</span>
+                      </div>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+
+            <div className="reports-card">
+              <h3 className="reports-card-title">Payment Split</h3>
+              {totalPayment === 0 ? (
+                <p className="reports-empty">No sales in this period.</p>
+              ) : (
+                <div className="reports-payment-split">
+                  {[["Cash", payment.cash ?? 0, cashPct, "cash"], ["Card", payment.card ?? 0, cardPct, "card"]].map(([label, amt, pct, cls]) => (
+                    <div key={cls} className="payment-split-item">
+                      <div className="payment-split-header">
+                        <span className="payment-split-method">{label}</span>
+                        <span className="payment-split-amount">${amt.toFixed(2)}</span>
+                        <span className="payment-split-pct">{pct.toFixed(1)}%</span>
+                      </div>
+                      <div className="payment-bar-track">
+                        <div className={`payment-bar-fill ${cls}`} style={{ width: `${pct}%` }} />
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+// ─── Users View (owner only) ─────────────────────────────────────────────────
+
+function UsersView({ currentUserId }) {
+  const [users, setUsers]               = useState([]);
+  const [loading, setLoading]           = useState(true);
+  const [form, setForm]                 = useState({ name: "", role: "cashier", pin: "", confirm: "" });
+  const [formError, setFormError]       = useState("");
+  const [formSuccess, setFormSuccess]   = useState("");
+  const [formLoading, setFormLoading]   = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(null);
+  const [changePinFor, setChangePinFor] = useState(null);
+  const [newPin, setNewPin]             = useState("");
+  const [newPinConfirm, setNewPinConfirm] = useState("");
+  const [pinChangeError, setPinChangeError] = useState("");
+
+  function load() {
+    apiFetch(`/api/users`)
+      .then(r => r.json())
+      .then(d => { setUsers(d); setLoading(false); });
+  }
+  useEffect(() => { load(); }, []);
+
+  async function handleAdd(e) {
+    e.preventDefault();
+    if (!/^\d{4,6}$/.test(form.pin)) return setFormError("PIN must be 4–6 digits");
+    if (form.pin !== form.confirm)   return setFormError("PINs don't match");
+    setFormLoading(true); setFormError(""); setFormSuccess("");
+    try {
+      const res  = await apiFetch(`/api/users`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: form.name, role: form.role, pin: form.pin }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error);
+      setFormSuccess(`${data.name} added successfully`);
+      setForm({ name: "", role: "cashier", pin: "", confirm: "" });
+      load();
+    } catch (err) {
+      setFormError(err.message);
+    } finally {
+      setFormLoading(false);
+    }
+  }
+
+  async function handleDelete(id) {
+    await apiFetch(`/api/users/${id}`, { method: "DELETE" });
+    setConfirmDelete(null);
+    load();
+  }
+
+  async function handleChangePin(id) {
+    if (!/^\d{4,6}$/.test(newPin)) return setPinChangeError("PIN must be 4–6 digits");
+    if (newPin !== newPinConfirm)  return setPinChangeError("PINs don't match");
+    const res = await apiFetch(`/api/users/${id}/pin`, {
+      method: "PATCH", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pin: newPin }),
+    });
+    if (res.ok) { setChangePinFor(null); setNewPin(""); setNewPinConfirm(""); setPinChangeError(""); }
+    else { const d = await res.json(); setPinChangeError(d.error); }
+  }
+
+  return (
+    <div className="users-view">
+      <div className="card">
+        <h2>Add User</h2>
+        {formSuccess && <div className="form-success">{formSuccess}</div>}
+        {formError   && <div className="form-error">{formError}</div>}
+        <form onSubmit={handleAdd}>
+          <div className="form-group">
+            <label>Name</label>
+            <input value={form.name} onChange={e => setForm(p => ({ ...p, name: e.target.value }))} placeholder="Employee name" required />
+          </div>
+          <div className="form-group">
+            <label>Role</label>
+            <select value={form.role} onChange={e => setForm(p => ({ ...p, role: e.target.value }))}>
+              <option value="cashier">Cashier — POS only</option>
+              <option value="manager">Manager — POS + Inventory + Sales + Customers</option>
+              <option value="owner">Owner — Full access</option>
+            </select>
+          </div>
+          <div className="users-pin-row">
+            <div className="form-group">
+              <label>PIN (4–6 digits)</label>
+              <input type="password" inputMode="numeric" maxLength={6} value={form.pin} onChange={e => setForm(p => ({ ...p, pin: e.target.value }))} placeholder="••••" required />
+            </div>
+            <div className="form-group">
+              <label>Confirm PIN</label>
+              <input type="password" inputMode="numeric" maxLength={6} value={form.confirm} onChange={e => setForm(p => ({ ...p, confirm: e.target.value }))} placeholder="••••" required />
+            </div>
+          </div>
+          <button className="btn-submit" disabled={formLoading}>{formLoading ? "Adding…" : "Add User"}</button>
+        </form>
+      </div>
+
+      <div className="card">
+        <h2>All Users</h2>
+        {loading && <p className="dashboard-empty">Loading…</p>}
+        <ul className="users-list">
+          {users.map(u => (
+            <li key={u.id} className="user-row">
+              <div className="user-row-avatar">{u.name.charAt(0).toUpperCase()}</div>
+              <div className="user-row-info">
+                <span className="user-row-name">
+                  {u.name}{u.id === currentUserId && <span className="you-badge"> (you)</span>}
+                </span>
+                <span className={`role-badge ${u.role}`}>{ROLE_LABELS[u.role]}</span>
+              </div>
+              <div className="user-row-actions">
+                {changePinFor === u.id ? (
+                  <div className="change-pin-inline">
+                    {pinChangeError && <div className="form-error small-error">{pinChangeError}</div>}
+                    <input type="password" inputMode="numeric" maxLength={6} placeholder="New PIN" value={newPin} onChange={e => setNewPin(e.target.value)} />
+                    <input type="password" inputMode="numeric" maxLength={6} placeholder="Confirm" value={newPinConfirm} onChange={e => setNewPinConfirm(e.target.value)} />
+                    <button className="btn-save-edit" onClick={() => handleChangePin(u.id)}>Save</button>
+                    <button className="btn-cancel-edit" onClick={() => { setChangePinFor(null); setNewPin(""); setNewPinConfirm(""); setPinChangeError(""); }}>Cancel</button>
+                  </div>
+                ) : (
+                  <button className="btn-change-pin" onClick={() => { setChangePinFor(u.id); setPinChangeError(""); }}>Change PIN</button>
+                )}
+                {u.id !== currentUserId && (
+                  confirmDelete === u.id ? (
+                    <div className="delete-confirm">
+                      <span>Delete?</span>
+                      <button className="btn-confirm-delete" onClick={() => handleDelete(u.id)}>Yes</button>
+                      <button className="btn-cancel-delete" onClick={() => setConfirmDelete(null)}>No</button>
+                    </div>
+                  ) : (
+                    <button className="btn-delete-customer" onClick={() => setConfirmDelete(u.id)}>Delete</button>
+                  )
+                )}
+              </div>
+            </li>
+          ))}
+        </ul>
+      </div>
+    </div>
+  );
+}
+
+// ─── ChatBot ─────────────────────────────────────────────────────────────────
+
+function ChatBot() {
+  const [open, setOpen]       = useState(false);
+  const [input, setInput]     = useState("");
+  const [loading, setLoading] = useState(false);
+  const [messages, setMessages] = useState([
+    { role: "assistant", content: "Hi! I'm your iSmart store assistant. Ask me anything — inventory levels, today's revenue, top products, low stock alerts, anything." },
+  ]);
+  const bottomRef = useRef(null);
+
+  useEffect(() => {
+    if (open) bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages, open]);
+
+  async function send() {
+    const text = input.trim();
+    if (!text || loading) return;
+    setInput("");
+    setMessages(prev => [...prev, { role: "user", content: text }]);
+    setLoading(true);
+    try {
+      const history = messages.slice(1).map(m => ({ role: m.role, content: m.content }));
+      const res  = await apiFetch(`/api/chat`, {
+        method:  "POST",
+        headers: { "Content-Type": "application/json" },
+        body:    JSON.stringify({ message: text, history }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error);
+      setMessages(prev => [...prev, { role: "assistant", content: data.reply }]);
+    } catch (err) {
+      setMessages(prev => [...prev, { role: "assistant", content: `Something went wrong: ${err.message}` }]);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <>
+      {open && (
+        <div className="chatbot-panel">
+          <div className="chatbot-header">
+            <span className="chatbot-title">iSmart Assistant</span>
+            <button className="chatbot-close" onClick={() => setOpen(false)}>✕</button>
+          </div>
+          <div className="chatbot-messages">
+            {messages.map((m, i) => (
+              <div key={i} className={`chat-bubble ${m.role}`}>{m.content}</div>
+            ))}
+            {loading && <div className="chat-bubble assistant chat-typing"><span /><span /><span /></div>}
+            <div ref={bottomRef} />
+          </div>
+          <div className="chatbot-input-row">
+            <input
+              className="chatbot-input"
+              placeholder="Ask about your store…"
+              value={input}
+              onChange={e => setInput(e.target.value)}
+              onKeyDown={e => e.key === "Enter" && send()}
+              disabled={loading}
+              autoFocus
+            />
+            <button className="chatbot-send" onClick={send} disabled={loading || !input.trim()}>Send</button>
+          </div>
+        </div>
+      )}
+      <button className="chatbot-fab" onClick={() => setOpen(o => !o)} title="Store Assistant">
+        {open ? "✕" : "💬"}
+      </button>
+    </>
   );
 }

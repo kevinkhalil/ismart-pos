@@ -1,29 +1,179 @@
+import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import pkg from "@prisma/client";
+import OpenAI from "openai";
+import bcrypt from "bcryptjs";
+import jwt from "jsonwebtoken";
+import rateLimit from "express-rate-limit";
+import cron from "node-cron";
+import { runQuotationAgent } from "./emailAgent.js";
 const { PrismaClient } = pkg;
+
+const azureAI = new OpenAI({ baseURL: process.env.AZURE_AI_ENDPOINT, apiKey: process.env.AZURE_AI_API_KEY });
 
 const app = express();
 const prisma = new PrismaClient();
-app.use(cors());
+app.use(cors({ origin: process.env.CLIENT_URL || "http://localhost:5173" }));
 app.use(express.json());
+
+// Verifies the Bearer token on every protected route and attaches { id, role } to req.user
+function authenticate(req, res, next) {
+  const header = req.headers.authorization;
+  const token = header?.startsWith("Bearer ") ? header.slice(7) : null;
+  if (!token) return res.status(401).json({ error: "Missing or invalid Authorization header" });
+  try {
+    req.user = jwt.verify(token, process.env.JWT_SECRET);
+    next();
+  } catch {
+    return res.status(401).json({ error: "Invalid or expired session — please log in again" });
+  }
+}
+
+// Use after authenticate() to restrict a route to specific roles
+function authorize(...roles) {
+  return (req, res, next) => {
+    if (!roles.includes(req.user.role)) return res.status(403).json({ error: "You don't have permission to do that" });
+    next();
+  };
+}
+
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many login attempts. Please wait a few minutes and try again." },
+});
 
 // A simple test: when someone visits /api/health, reply with a little message
 app.get("/api/health", (req, res) => {
   res.json({ status: "ok", message: "iSmart kitchen is open!" });
 });
 
+// GET /api/users/list — public, returns names + roles only (for login screen)
+app.get("/api/users/list", async (req, res) => {
+  try {
+    const users = await prisma.user.findMany({
+      select: { id: true, name: true, role: true },
+      orderBy: { createdAt: "asc" },
+    });
+    res.json(users);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/auth/setup — create first owner (only when no users exist)
+app.post("/api/auth/setup", async (req, res) => {
+  const { name, pin } = req.body;
+  if (!name || !pin) return res.status(400).json({ error: "name and pin required" });
+  try {
+    const count = await prisma.user.count();
+    if (count > 0) return res.status(403).json({ error: "Setup already complete" });
+    const hashed = await bcrypt.hash(String(pin), 10);
+    const user   = await prisma.user.create({ data: { name, role: "owner", pin: hashed } });
+    const token  = jwt.sign({ id: user.id, role: user.role }, process.env.JWT_SECRET, { expiresIn: "12h" });
+    res.json({ id: user.id, name: user.name, role: user.role, token });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/auth/login — { userId, pin } → { id, name, role, token }
+app.post("/api/auth/login", loginLimiter, async (req, res) => {
+  const { userId, pin } = req.body;
+  if (!userId || pin === undefined) return res.status(400).json({ error: "userId and pin required" });
+  try {
+    const user = await prisma.user.findUnique({ where: { id: parseInt(userId) } });
+    if (!user) return res.status(401).json({ error: "Incorrect PIN" });
+    const match = await bcrypt.compare(String(pin), user.pin);
+    if (!match) return res.status(401).json({ error: "Incorrect PIN" });
+    const token = jwt.sign({ id: user.id, role: user.role }, process.env.JWT_SECRET, { expiresIn: "12h" });
+    res.json({ id: user.id, name: user.name, role: user.role, token });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/users — full user list (owner only)
+app.get("/api/users", authenticate, authorize("owner"), async (req, res) => {
+  try {
+    const users = await prisma.user.findMany({
+      select: { id: true, name: true, role: true, createdAt: true },
+      orderBy: { createdAt: "asc" },
+    });
+    res.json(users);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/users — create a new user (owner only)
+app.post("/api/users", authenticate, authorize("owner"), async (req, res) => {
+  const { name, role, pin } = req.body;
+  if (!name || !role || !pin) return res.status(400).json({ error: "name, role, and pin required" });
+  if (!["cashier", "manager", "owner"].includes(role)) return res.status(400).json({ error: "Invalid role" });
+  if (!/^\d{4,6}$/.test(String(pin))) return res.status(400).json({ error: "PIN must be 4–6 digits" });
+  try {
+    const hashed = await bcrypt.hash(String(pin), 10);
+    const user   = await prisma.user.create({
+      data: { name, role, pin: hashed },
+      select: { id: true, name: true, role: true, createdAt: true },
+    });
+    res.status(201).json(user);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// PATCH /api/users/:id/pin — change a user's PIN (owner only)
+app.patch("/api/users/:id/pin", authenticate, authorize("owner"), async (req, res) => {
+  const id  = parseInt(req.params.id);
+  const { pin } = req.body;
+  if (!pin) return res.status(400).json({ error: "pin required" });
+  if (!/^\d{4,6}$/.test(String(pin))) return res.status(400).json({ error: "PIN must be 4–6 digits" });
+  try {
+    const hashed = await bcrypt.hash(String(pin), 10);
+    await prisma.user.update({ where: { id }, data: { pin: hashed } });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// DELETE /api/users/:id (owner only)
+app.delete("/api/users/:id", authenticate, authorize("owner"), async (req, res) => {
+  const id = parseInt(req.params.id);
+  try {
+    const target = await prisma.user.findUnique({ where: { id } });
+    if (target?.role === "owner") {
+      const ownerCount = await prisma.user.count({ where: { role: "owner" } });
+      if (ownerCount <= 1) return res.status(400).json({ error: "Cannot delete the last owner account" });
+    }
+    await prisma.user.delete({ where: { id } });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
 // Get all products, each with its in_stock units.
 // Filtering units here means the client only sees units it can actually sell.
-app.get("/api/products", async (req, res) => {
-  const products = await prisma.product.findMany({
-    include: { units: { where: { status: "in_stock" } }, category: true },
-  });
-  res.json(products);
+app.get("/api/products", authenticate, async (req, res) => {
+  try {
+    const products = await prisma.product.findMany({
+      include: { units: { where: { status: "in_stock" } }, category: true },
+    });
+    res.json(products);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // GET /api/dashboard — all numbers the dashboard needs, in one request
-app.get("/api/dashboard", async (req, res) => {
+app.get("/api/dashboard", authenticate, authorize("owner"), async (req, res) => {
+  try {
   const startOfDay = new Date();
   startOfDay.setHours(0, 0, 0, 0);
 
@@ -111,19 +261,96 @@ app.get("/api/dashboard", async (req, res) => {
     lowStock: [...lowStockAccessories, ...outOfStockPhones],
     topProducts,
   });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/reports/owner — fire owner summary email via Power Automate
+app.post("/api/reports/owner", authenticate, authorize("owner"), async (req, res) => {
+  if (!process.env.OWNER_REPORT_URL) {
+    return res.status(500).json({ error: "OWNER_REPORT_URL not set" });
+  }
+
+  const startOfDay = new Date();
+  startOfDay.setHours(0, 0, 0, 0);
+
+  const [todayStats, allTimeStats, lowStockAccessories, serializedProducts, saleItems] =
+    await Promise.all([
+      prisma.sale.aggregate({ where: { createdAt: { gte: startOfDay } }, _sum: { totalPrice: true }, _count: { id: true } }),
+      prisma.sale.aggregate({ _sum: { totalPrice: true }, _count: { id: true } }),
+      prisma.product.findMany({ where: { isSerialized: false, quantity: { lte: 5 } }, orderBy: { quantity: "asc" }, select: { name: true, quantity: true } }),
+      prisma.product.findMany({ where: { isSerialized: true }, include: { units: { where: { status: "in_stock" }, select: { id: true } } } }),
+      prisma.saleItem.findMany({ include: { product: { select: { name: true } } } }),
+    ]);
+
+  const outOfStockPhones = serializedProducts
+    .filter(p => p.units.length === 0)
+    .map(p => ({ name: p.name, quantity: 0 }));
+
+  const lowStock = [...lowStockAccessories, ...outOfStockPhones];
+
+  const byProduct = {};
+  for (const item of saleItems) {
+    if (!byProduct[item.productId]) byProduct[item.productId] = { name: item.product.name, revenue: 0, unitsSold: 0 };
+    byProduct[item.productId].revenue   += item.unitPrice * item.quantity;
+    byProduct[item.productId].unitsSold += item.quantity;
+  }
+  const topProducts = Object.values(byProduct).sort((a, b) => b.revenue - a.revenue).slice(0, 5);
+
+  const topProductsText = topProducts.length === 0
+    ? "No sales recorded yet."
+    : topProducts.map((p, i) => `#${i + 1} ${p.name} — $${p.revenue.toFixed(2)} (${p.unitsSold} sold)`).join("\n");
+
+  const lowStockText = lowStock.length === 0
+    ? "All products are well stocked."
+    : lowStock.map(p => p.quantity === 0 ? `• ${p.name} — OUT OF STOCK` : `• ${p.name} — ${p.quantity} left`).join("\n");
+
+  const payload = {
+    todayRevenue:    todayStats._sum.totalPrice  ?? 0,
+    todaySales:      todayStats._count.id,
+    allTimeRevenue:  allTimeStats._sum.totalPrice ?? 0,
+    topProductsText,
+    lowStockText,
+  };
+
+  console.log("[Owner Report] Firing webhook…");
+  console.log("[Owner Report] Payload:", JSON.stringify(payload, null, 2));
+
+  try {
+    const r = await fetch(process.env.OWNER_REPORT_URL, {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body:    JSON.stringify(payload),
+    });
+    console.log(`[Owner Report] Response: ${r.status} ${r.statusText}`);
+    if (!r.ok) {
+      const text = await r.text();
+      console.error("[Owner Report] Error body:", text);
+      return res.status(502).json({ error: `Power Automate returned ${r.status}`, detail: text });
+    }
+    res.json({ success: true });
+  } catch (err) {
+    console.error("[Owner Report] Fetch failed:", err.message);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // GET /api/categories — all categories with their children
-app.get("/api/categories", async (req, res) => {
-  const categories = await prisma.category.findMany({
-    orderBy: { name: "asc" },
-    include: { children: { orderBy: { name: "asc" } } },
-  });
-  res.json(categories);
+app.get("/api/categories", authenticate, async (req, res) => {
+  try {
+    const categories = await prisma.category.findMany({
+      orderBy: { name: "asc" },
+      include: { children: { orderBy: { name: "asc" } } },
+    });
+    res.json(categories);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // POST /api/categories — create a new category or sub-category
-app.post("/api/categories", async (req, res) => {
+app.post("/api/categories", authenticate, authorize("manager", "owner"), async (req, res) => {
   const { name, parentId } = req.body;
   if (!name) return res.status(400).json({ error: "name is required" });
   const category = await prisma.category.create({
@@ -133,7 +360,7 @@ app.post("/api/categories", async (req, res) => {
 });
 
 // DELETE /api/categories/:id
-app.delete("/api/categories/:id", async (req, res) => {
+app.delete("/api/categories/:id", authenticate, authorize("manager", "owner"), async (req, res) => {
   const id = parseInt(req.params.id);
   try {
     await prisma.$transaction(async (tx) => {
@@ -148,7 +375,7 @@ app.delete("/api/categories/:id", async (req, res) => {
 });
 
 // PATCH /api/sales/:saleId/items/:itemId/refund — refund one line item, restore stock
-app.patch("/api/sales/:saleId/items/:itemId/refund", async (req, res) => {
+app.patch("/api/sales/:saleId/items/:itemId/refund", authenticate, async (req, res) => {
   const saleId = parseInt(req.params.saleId);
   const itemId = parseInt(req.params.itemId);
   try {
@@ -177,29 +404,129 @@ app.patch("/api/sales/:saleId/items/:itemId/refund", async (req, res) => {
   }
 });
 
-// GET /api/sales — full sales history, newest first
-app.get("/api/sales", async (req, res) => {
-  const sales = await prisma.sale.findMany({
-    orderBy: { createdAt: "desc" },
-    include: {
-      customer: true,
-      items: {
-        include: {
-          product: { select: { name: true } },
-          unit:    { select: { imei: true } },
+// GET /api/returns/search?q=<saleId or customer name>
+app.get("/api/returns/search", authenticate, async (req, res) => {
+  try {
+    const { q } = req.query;
+    if (!q) return res.json([]);
+
+    const asId = parseInt(q);
+    const where = isNaN(asId)
+      ? { customer: { name: { contains: q } } }
+      : { OR: [{ id: asId }, { customer: { name: { contains: q } } }] };
+
+    const sales = await prisma.sale.findMany({
+      where,
+      orderBy: { createdAt: "desc" },
+      take: 20,
+      include: {
+        customer: true,
+        items: { include: { product: { select: { name: true } }, unit: { select: { imei: true } } } },
+      },
+    });
+    res.json(sales);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/reports/analytics?from=YYYY-MM-DD&to=YYYY-MM-DD
+app.get("/api/reports/analytics", authenticate, authorize("manager", "owner"), async (req, res) => {
+  try {
+    let { from, to } = req.query;
+    if (!from) { const d = new Date(); d.setDate(d.getDate() - 29); from = d.toISOString().slice(0, 10); }
+    if (!to)   { to = new Date().toISOString().slice(0, 10); }
+
+    const fromDate = new Date(from);
+    const toDate   = new Date(to);
+    toDate.setDate(toDate.getDate() + 1);
+
+    const sales = await prisma.sale.findMany({
+      where:   { createdAt: { gte: fromDate, lt: toDate } },
+      orderBy: { createdAt: "asc" },
+      include: { items: { include: { product: { select: { name: true } } } } },
+    });
+
+    // Pre-fill every day in range with zero so chart shows continuous bars
+    const dailyMap = {};
+    const cursor   = new Date(from);
+    const end      = new Date(to);
+    while (cursor <= end) {
+      const key = `${cursor.getFullYear()}-${String(cursor.getMonth()+1).padStart(2,"0")}-${String(cursor.getDate()).padStart(2,"0")}`;
+      dailyMap[key] = { date: key, revenue: 0, sales: 0 };
+      cursor.setDate(cursor.getDate() + 1);
+    }
+
+    const payment   = { cash: 0, card: 0 };
+    const byProduct = {};
+
+    for (const sale of sales) {
+      const d   = sale.createdAt;
+      const key = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
+      if (dailyMap[key]) { dailyMap[key].revenue += sale.totalPrice; dailyMap[key].sales += 1; }
+
+      payment[sale.paymentMethod] = (payment[sale.paymentMethod] ?? 0) + sale.totalPrice;
+
+      for (const item of sale.items) {
+        if (!byProduct[item.productId]) byProduct[item.productId] = { name: item.product.name, revenue: 0, unitsSold: 0 };
+        byProduct[item.productId].revenue   += item.unitPrice * item.quantity;
+        byProduct[item.productId].unitsSold += item.quantity;
+      }
+    }
+
+    const totalRevenue = sales.reduce((sum, s) => sum + s.totalPrice, 0);
+    const totalSales   = sales.length;
+
+    res.json({
+      summary:     { totalRevenue, totalSales, avgOrderValue: totalSales > 0 ? totalRevenue / totalSales : 0 },
+      daily:       Object.values(dailyMap),
+      topProducts: Object.values(byProduct).sort((a, b) => b.revenue - a.revenue).slice(0, 5),
+      payment,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/sales?from=YYYY-MM-DD&to=YYYY-MM-DD — sales history with optional date range
+app.get("/api/sales", authenticate, authorize("manager", "owner"), async (req, res) => {
+  try {
+    const { from, to } = req.query;
+    const where = {};
+    if (from || to) {
+      where.createdAt = {};
+      if (from) where.createdAt.gte = new Date(from);
+      if (to) {
+        const toDate = new Date(to);
+        toDate.setDate(toDate.getDate() + 1);
+        where.createdAt.lt = toDate;
+      }
+    }
+    const sales = await prisma.sale.findMany({
+      where,
+      orderBy: { createdAt: "desc" },
+      include: {
+        customer: true,
+        items: {
+          include: {
+            product: { select: { name: true } },
+            unit:    { select: { imei: true } },
+          },
         },
       },
-    },
-  });
-  res.json(sales);
+    });
+    res.json(sales);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // POST /api/sales
 // Body: { items: [...], customer?: { name, phone, email } }
 // If customer.phone matches an existing customer, that customer is linked.
 // If not, a new customer row is created. Customer is always optional.
-app.post("/api/sales", async (req, res) => {
-  const { items, customer, paymentMethod } = req.body;
+app.post("/api/sales", authenticate, async (req, res) => {
+  const { items, customer, paymentMethod, discount } = req.body;
 
   if (!Array.isArray(items) || items.length === 0) {
     return res.status(400).json({ error: "items must be a non-empty array" });
@@ -260,6 +587,13 @@ app.post("/api/sales", async (req, res) => {
         }
       }
 
+      if (discount?.value > 0) {
+        const amt = discount.type === "pct"
+          ? totalPrice * (Math.min(discount.value, 100) / 100)
+          : Math.min(discount.value, totalPrice);
+        totalPrice = Math.max(0, totalPrice - amt);
+      }
+
       return tx.sale.create({
         data: {
           totalPrice,
@@ -275,13 +609,56 @@ app.post("/api/sales", async (req, res) => {
     });
 
     res.status(201).json(sale);
+
+    // Fire receipt email via Power Automate — only if the customer has an email address
+    if (sale.customer?.email) {
+      if (!process.env.POWER_AUTOMATE_URL) {
+        console.log("[PA] Skipped — POWER_AUTOMATE_URL not set in .env");
+      } else {
+        const itemsText = sale.items
+          .map(i => `• ${i.product?.name || "Item"} ×${i.quantity} — $${(i.unitPrice * i.quantity).toFixed(2)}`)
+          .join("\n");
+
+        const date = new Date(sale.createdAt).toLocaleString("en-US", {
+          year: "numeric", month: "long", day: "numeric",
+          hour: "2-digit", minute: "2-digit",
+        });
+
+        const payload = {
+          customerName:  sale.customer.name,
+          customerEmail: sale.customer.email,
+          saleId:        sale.id,
+          totalPrice:    sale.totalPrice,
+          paymentMethod: sale.paymentMethod === "card" ? "Card" : "Cash",
+          createdAt:     date,
+          itemsText,
+        };
+
+        console.log(`[PA] Firing webhook for sale #${sale.id} → ${sale.customer.email}`);
+        console.log("[PA] Payload:", JSON.stringify(payload, null, 2));
+
+        fetch(process.env.POWER_AUTOMATE_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        })
+          .then(r => {
+            console.log(`[PA] Response status: ${r.status} ${r.statusText}`);
+            if (!r.ok) r.text().then(t => console.error("[PA] Error body:", t));
+          })
+          .catch(e => console.error("[PA] Fetch failed:", e.message));
+      }
+    } else {
+      console.log(`[PA] Skipped — sale #${sale.id} has no customer email`);
+    }
+
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
 });
 
 // PATCH /api/customers/:id — update a customer's name, phone, or email
-app.patch("/api/customers/:id", async (req, res) => {
+app.patch("/api/customers/:id", authenticate, authorize("manager", "owner"), async (req, res) => {
   const id = parseInt(req.params.id);
   const { name, phone, email } = req.body;
   try {
@@ -303,7 +680,7 @@ app.patch("/api/customers/:id", async (req, res) => {
 });
 
 // DELETE /api/customers/:id — remove a customer, unlinking their past sales (sales are kept)
-app.delete("/api/customers/:id", async (req, res) => {
+app.delete("/api/customers/:id", authenticate, authorize("manager", "owner"), async (req, res) => {
   const id = parseInt(req.params.id);
   try {
     await prisma.$transaction(async (tx) => {
@@ -317,15 +694,20 @@ app.delete("/api/customers/:id", async (req, res) => {
 });
 
 // GET /api/customers/lookup?phone=xxx — find a single customer by exact phone number
-app.get("/api/customers/lookup", async (req, res) => {
-  const { phone } = req.query;
-  if (!phone) return res.json(null);
-  const customer = await prisma.customer.findUnique({ where: { phone } });
-  res.json(customer ?? null);
+app.get("/api/customers/lookup", authenticate, async (req, res) => {
+  try {
+    const { phone } = req.query;
+    if (!phone) return res.json(null);
+    const customer = await prisma.customer.findUnique({ where: { phone } });
+    res.json(customer ?? null);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // GET /api/customers — all customers, each with stats and full purchase history
-app.get("/api/customers", async (req, res) => {
+app.get("/api/customers", authenticate, authorize("manager", "owner"), async (req, res) => {
+  try {
   const customers = await prisma.customer.findMany({
     orderBy: { createdAt: "desc" },
     include: {
@@ -360,10 +742,13 @@ app.get("/api/customers", async (req, res) => {
   result.sort((a, b) => b.totalSpent - a.totalSpent);
 
   res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // PATCH /api/products/:id — update an existing product's details
-app.patch("/api/products/:id", async (req, res) => {
+app.patch("/api/products/:id", authenticate, authorize("manager", "owner"), async (req, res) => {
   const id = parseInt(req.params.id);
   const { name, sellPrice, costPrice, upc, categoryId } = req.body;
   try {
@@ -384,7 +769,7 @@ app.patch("/api/products/:id", async (req, res) => {
 });
 
 // POST /api/products — create a brand-new product
-app.post("/api/products", async (req, res) => {
+app.post("/api/products", authenticate, authorize("manager", "owner"), async (req, res) => {
   const { name, sellPrice, costPrice, upc, isSerialized, quantity, categoryId } = req.body;
   if (!name || sellPrice == null) {
     return res.status(400).json({ error: "name and sellPrice are required" });
@@ -404,7 +789,7 @@ app.post("/api/products", async (req, res) => {
 });
 
 // POST /api/products/:id/units — add a new phone unit (IMEI) to an existing serialized product
-app.post("/api/products/:id/units", async (req, res) => {
+app.post("/api/products/:id/units", authenticate, authorize("manager", "owner"), async (req, res) => {
   const productId = parseInt(req.params.id);
   const { imei, costPrice } = req.body;
   if (!imei) return res.status(400).json({ error: "imei is required" });
@@ -427,7 +812,7 @@ app.post("/api/products/:id/units", async (req, res) => {
 });
 
 // PATCH /api/products/:id/stock — add quantity to an existing accessory
-app.patch("/api/products/:id/stock", async (req, res) => {
+app.patch("/api/products/:id/stock", authenticate, authorize("manager", "owner"), async (req, res) => {
   const productId = parseInt(req.params.id);
   const qty = parseInt(req.body.quantity);
   if (!qty || qty < 1) return res.status(400).json({ error: "quantity must be at least 1" });
@@ -443,6 +828,142 @@ app.patch("/api/products/:id/stock", async (req, res) => {
   res.json(updated);
 });
 
-app.listen(3000, () => {
-  console.log("Server running on http://localhost:3000");
+// POST /api/chat — AI store assistant powered by Azure AI Foundry (gpt-5-mini)
+app.post("/api/chat", authenticate, authorize("manager", "owner"), async (req, res) => {
+  if (!process.env.AZURE_AI_ENDPOINT || !process.env.AZURE_AI_API_KEY) {
+    return res.status(500).json({ error: "AZURE_AI_ENDPOINT or AZURE_AI_API_KEY not set in .env" });
+  }
+
+  const { message, history = [] } = req.body;
+  if (!message) return res.status(400).json({ error: "message is required" });
+
+  try {
+    const startOfDay = new Date();
+    startOfDay.setHours(0, 0, 0, 0);
+
+    const [products, todayStats, allTimeStats, lowStockAcc, serializedProds, saleItems, customerCount, recentSales] =
+      await Promise.all([
+        prisma.product.findMany({ include: { units: { where: { status: "in_stock" } } } }),
+        prisma.sale.aggregate({ where: { createdAt: { gte: startOfDay } }, _sum: { totalPrice: true }, _count: { id: true } }),
+        prisma.sale.aggregate({ _sum: { totalPrice: true }, _count: { id: true } }),
+        prisma.product.findMany({ where: { isSerialized: false, quantity: { lte: 5 } }, orderBy: { quantity: "asc" } }),
+        prisma.product.findMany({ where: { isSerialized: true }, include: { units: { where: { status: "in_stock" } } } }),
+        prisma.saleItem.findMany({ include: { product: { select: { name: true } } } }),
+        prisma.customer.count(),
+        prisma.sale.findMany({
+          take: 5, orderBy: { createdAt: "desc" },
+          include: { customer: true, items: { include: { product: { select: { name: true } } } } },
+        }),
+      ]);
+
+    // Top products by revenue
+    const byProduct = {};
+    for (const item of saleItems) {
+      if (!byProduct[item.productId]) byProduct[item.productId] = { name: item.product.name, revenue: 0, unitsSold: 0 };
+      byProduct[item.productId].revenue   += item.unitPrice * item.quantity;
+      byProduct[item.productId].unitsSold += item.quantity;
+    }
+    const topProducts = Object.values(byProduct).sort((a, b) => b.revenue - a.revenue).slice(0, 5);
+
+    const outOfStockPhones = serializedProds.filter(p => p.units.length === 0).map(p => ({ name: p.name, quantity: 0 }));
+    const lowStock = [...lowStockAcc, ...outOfStockPhones];
+
+    const inventoryLines = products.map(p => {
+      const stock = p.isSerialized ? `${p.units.length} units in stock` : `${p.quantity} in stock`;
+      return `- ${p.name}: sell $${p.sellPrice}, ${stock}`;
+    }).join("\n");
+
+    const context = `
+TODAY (${new Date().toLocaleDateString("en-US", { weekday: "long", year: "numeric", month: "long", day: "numeric" })}):
+- Revenue: $${(todayStats._sum.totalPrice ?? 0).toFixed(2)}
+- Sales: ${todayStats._count.id}
+
+ALL TIME:
+- Total Revenue: $${(allTimeStats._sum.totalPrice ?? 0).toFixed(2)}
+- Total Sales: ${allTimeStats._count.id}
+- Total Customers: ${customerCount}
+
+INVENTORY:
+${inventoryLines || "No products yet."}
+
+LOW STOCK ALERTS:
+${lowStock.length === 0 ? "All items well stocked." : lowStock.map(p => p.quantity === 0 ? `- ${p.name}: OUT OF STOCK` : `- ${p.name}: ${p.quantity} left`).join("\n")}
+
+TOP PRODUCTS BY REVENUE:
+${topProducts.length === 0 ? "No sales yet." : topProducts.map((p, i) => `${i + 1}. ${p.name} — $${p.revenue.toFixed(2)} (${p.unitsSold} sold)`).join("\n")}
+
+RECENT SALES (last 5):
+${recentSales.length === 0 ? "No sales yet." : recentSales.map(s => `- Sale #${s.id}: $${s.totalPrice.toFixed(2)} (${s.paymentMethod}) — ${s.customer?.name || "Walk-in"} — ${s.items.map(i => i.product.name).join(", ")}`).join("\n")}
+`.trim();
+
+    const response = await azureAI.responses.create({
+      model: process.env.AZURE_AI_DEPLOYMENT,
+      instructions: `You are an AI assistant for iSmart, a smartphone retail shop. You help the store manager answer questions about inventory, sales, and customers. Be concise, friendly, and accurate. Only use numbers from the store data provided — never make up figures. If something isn't in the data, say so.\n\nLIVE STORE DATA:\n${context}`,
+      input: [
+        ...history,
+        { role: "user", content: message },
+      ],
+    });
+
+    res.json({ reply: response.output_text });
+  } catch (err) {
+    console.error("[Chat] Error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
+
+// ── Scheduled owner report — fires every day at 09:00 ──────────────────────
+async function fireOwnerReport() {
+  if (!process.env.OWNER_REPORT_URL) return;
+  try {
+    const startOfDay = new Date();
+    startOfDay.setHours(0, 0, 0, 0);
+
+    const [todayStats, allTimeStats, lowStockAccessories, serializedProducts, saleItems] =
+      await Promise.all([
+        prisma.sale.aggregate({ where: { createdAt: { gte: startOfDay } }, _sum: { totalPrice: true }, _count: { id: true } }),
+        prisma.sale.aggregate({ _sum: { totalPrice: true }, _count: { id: true } }),
+        prisma.product.findMany({ where: { isSerialized: false, quantity: { lte: 5 } }, orderBy: { quantity: "asc" }, select: { name: true, quantity: true } }),
+        prisma.product.findMany({ where: { isSerialized: true }, include: { units: { where: { status: "in_stock" }, select: { id: true } } } }),
+        prisma.saleItem.findMany({ include: { product: { select: { name: true } } } }),
+      ]);
+
+    const outOfStockPhones = serializedProducts.filter(p => p.units.length === 0).map(p => ({ name: p.name, quantity: 0 }));
+    const lowStock = [...lowStockAccessories, ...outOfStockPhones];
+    const byProduct = {};
+    for (const item of saleItems) {
+      if (!byProduct[item.productId]) byProduct[item.productId] = { name: item.product.name, revenue: 0, unitsSold: 0 };
+      byProduct[item.productId].revenue   += item.unitPrice * item.quantity;
+      byProduct[item.productId].unitsSold += item.quantity;
+    }
+    const topProducts = Object.values(byProduct).sort((a, b) => b.revenue - a.revenue).slice(0, 5);
+
+    const payload = {
+      todayRevenue:   todayStats._sum.totalPrice  ?? 0,
+      todaySales:     todayStats._count.id,
+      allTimeRevenue: allTimeStats._sum.totalPrice ?? 0,
+      topProductsText: topProducts.length === 0 ? "No sales recorded yet." : topProducts.map((p, i) => `#${i+1} ${p.name} — $${p.revenue.toFixed(2)} (${p.unitsSold} sold)`).join("\n"),
+      lowStockText:    lowStock.length === 0 ? "All products well stocked." : lowStock.map(p => p.quantity === 0 ? `• ${p.name} — OUT OF STOCK` : `• ${p.name} — ${p.quantity} left`).join("\n"),
+    };
+
+    await fetch(process.env.OWNER_REPORT_URL, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
+    });
+    console.log("[Cron] Owner report sent at", new Date().toLocaleTimeString());
+  } catch (err) {
+    console.error("[Cron] Owner report failed:", err.message);
+  }
+}
+
+// "0 9 * * *" = every day at 09:00 server local time
+cron.schedule("0 9 * * *", fireOwnerReport);
+
+// Poll support inbox every 2 minutes for quotation requests
+cron.schedule("*/2 * * * *", () => {
+  runQuotationAgent(prisma).catch(err => console.error("[QuotationAgent] Uncaught:", err.message));
 });

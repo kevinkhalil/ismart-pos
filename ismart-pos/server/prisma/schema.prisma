@@ -72,6 +72,14 @@ model Sale {
   items         SaleItem[]
 }
 
+model User {
+  id        Int      @id @default(autoincrement())
+  name      String
+  role      String   @default("cashier")
+  pin       String
+  createdAt DateTime @default(now())
+}
+
 // One row per line in the cart. unitPrice is copied from Product.sellPrice at sale time.
 model SaleItem {
   id            Int          @id @default(autoincrement())
